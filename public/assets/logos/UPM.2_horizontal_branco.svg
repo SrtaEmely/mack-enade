@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 320" width="100%" height="100%">
+  
+  <g transform="translate(20, 20) scale(0.56)">
+    <circle cx="250" cy="250" r="212" fill="none" stroke="#FFFFFF" stroke-width="46"/>
+    <path d="M 128 140 H 202 V 158 C 188 160 184 170 184 186 V 314 C 184 330 188 340 202 342 V 360 H 128 V 342 C 142 340 146 330 146 314 V 186 C 146 170 142 160 128 158 Z" fill="#FFFFFF"/>
+    <path d="M 298 140 H 372 V 158 C 358 160 354 170 354 186 V 314 C 354 330 358 340 372 342 V 360 H 298 V 342 C 312 340 316 330 316 314 V 186 C 316 170 312 160 298 158 Z" fill="#FFFFFF"/>
+    <path d="M 184 182 L 243 328 C 246 335 254 335 257 328 L 316 182 L 282 182 L 250 268 L 218 182 Z" fill="#FFFFFF"/>
+  </g>
+  <text x="340" y="128" font-family="'Helvetica Neue', Helvetica, Arial, sans-serif" font-size="46" font-weight="600" fill="#FFFFFF" letter-spacing="-0.5">Universidade Presbiteriana</text>
+  <text x="340" y="230" font-family="'Helvetica Neue', Helvetica, Arial, sans-serif" font-size="112" font-weight="800" fill="#FFFFFF" letter-spacing="-2.5">Mackenzie</text>
+</svg>

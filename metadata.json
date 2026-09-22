@@ -1,6 +1,6 @@
 {
   "name": "Mack ENADE",
-  "description": "Plataforma gamificada de preparação para o ENADE",
+  "description": "Plataforma de preparação para o ENADE",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }

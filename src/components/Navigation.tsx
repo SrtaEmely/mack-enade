@@ -34,7 +34,6 @@ interface NavigationProps {
   student: Student;
   professor?: Professor;
   currentUser?: InternalUserProfile | null;
-  onSwitchRole: (role: UserRole) => void;
   onLogout: () => void;
 }
 
@@ -45,7 +44,6 @@ export const Navigation: React.FC<NavigationProps> = ({
   student,
   professor,
   currentUser,
-  onSwitchRole,
   onLogout,
 }) => {
   const [showProfileMenu, setShowProfileMenu] = useState(false);
@@ -131,30 +129,6 @@ export const Navigation: React.FC<NavigationProps> = ({
           <div className="flex items-center gap-2.5 sm:gap-3">
             {/* Install PWA Button (only visible when installable and not installed) */}
             <PWAInstallButton variant="header" />
-
-            {/* Quick Role Switcher Pill */}
-            <div className="flex items-center p-0.5 bg-zinc-100 rounded-xl border border-zinc-200/80 text-[11px] font-bold">
-              <button
-                onClick={() => onSwitchRole('student')}
-                className={`px-2.5 py-1 rounded-lg transition-all cursor-pointer ${
-                  userRole === 'student'
-                    ? 'bg-white text-[#EA0029] shadow-2xs'
-                    : 'text-zinc-500 hover:text-zinc-800'
-                }`}
-              >
-                Estudante
-              </button>
-              <button
-                onClick={() => onSwitchRole('professor')}
-                className={`px-2.5 py-1 rounded-lg transition-all cursor-pointer ${
-                  userRole === 'professor'
-                    ? 'bg-[#EA0029] text-white shadow-2xs'
-                    : 'text-zinc-500 hover:text-zinc-800'
-                }`}
-              >
-                Docente
-              </button>
-            </div>
 
             {/* Student Gamification Pills (only shown if student) */}
             {userRole === 'student' && (

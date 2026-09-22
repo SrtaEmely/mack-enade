@@ -1,5 +1,7 @@
+import 'dotenv/config';
 import express, { Request, Response } from 'express';
 import path from 'path';
+import crypto from 'crypto';
 import { createServer as createViteServer } from 'vite';
 import { GoogleGenAI } from '@google/genai';
 import {
@@ -114,9 +116,113 @@ function formatQuestionForClient(q: SheetQuestion): Question & Record<string, an
   };
 }
 
+
+const SESSION_COOKIE_NAME = 'mack_enade_session';
+const SESSION_MAX_AGE_SECONDS = 8 * 60 * 60;
+let ephemeralSessionSecret: string | null = null;
+
+function getSessionSecret(): string {
+  if (process.env.SESSION_SECRET && process.env.SESSION_SECRET.trim()) return process.env.SESSION_SECRET.trim();
+  if (process.env.GOOGLE_SERVICE_ACCOUNT_JSON) {
+    return crypto.createHash('sha256').update(process.env.GOOGLE_SERVICE_ACCOUNT_JSON + ':mack-enade-session').digest('hex');
+  }
+  if (!ephemeralSessionSecret) {
+    ephemeralSessionSecret = crypto.randomBytes(32).toString('hex');
+    console.warn('[Security] SESSION_SECRET ausente; usando segredo efêmero. Sessões serão invalidadas após reinício.');
+  }
+  return ephemeralSessionSecret;
+}
+
+function b64url(value: string): string {
+  return Buffer.from(value, 'utf8').toString('base64url');
+}
+
+function signSession(user: PilotAuthUser): string {
+  const payload = b64url(JSON.stringify({ user, exp: Math.floor(Date.now() / 1000) + SESSION_MAX_AGE_SECONDS }));
+  const sig = crypto.createHmac('sha256', getSessionSecret()).update(payload).digest('base64url');
+  return `${payload}.${sig}`;
+}
+
+function parseCookies(req: Request): Record<string, string> {
+  const raw = req.headers.cookie || '';
+  const out: Record<string, string> = {};
+  raw.split(';').forEach((part) => {
+    const idx = part.indexOf('=');
+    if (idx < 0) return;
+    const key = part.slice(0, idx).trim();
+    const val = part.slice(idx + 1).trim();
+    if (key) out[key] = decodeURIComponent(val);
+  });
+  return out;
+}
+
+function getSessionUser(req: Request): PilotAuthUser | null {
+  try {
+    const token = parseCookies(req)[SESSION_COOKIE_NAME];
+    if (!token) return null;
+    const [payload, sig] = token.split('.');
+    if (!payload || !sig) return null;
+    const expected = crypto.createHmac('sha256', getSessionSecret()).update(payload).digest('base64url');
+    const a = Buffer.from(sig);
+    const b = Buffer.from(expected);
+    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;
+    const parsed = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
+    if (!parsed.exp || parsed.exp < Math.floor(Date.now() / 1000)) return null;
+    return parsed.user as PilotAuthUser;
+  } catch {
+    return null;
+  }
+}
+
+function setSessionCookie(req: Request, res: Response, user: PilotAuthUser): void {
+  const secure = process.env.NODE_ENV === 'production' || String(req.headers['x-forwarded-proto'] || '').includes('https');
+  const cookie = [
+    `${SESSION_COOKIE_NAME}=${encodeURIComponent(signSession(user))}`,
+    'HttpOnly',
+    'SameSite=Lax',
+    'Path=/',
+    `Max-Age=${SESSION_MAX_AGE_SECONDS}`,
+    secure ? 'Secure' : '',
+  ].filter(Boolean).join('; ');
+  res.setHeader('Set-Cookie', cookie);
+}
+
+function clearSessionCookie(req: Request, res: Response): void {
+  const secure = process.env.NODE_ENV === 'production' || String(req.headers['x-forwarded-proto'] || '').includes('https');
+  res.setHeader('Set-Cookie', [
+    `${SESSION_COOKIE_NAME}=`,
+    'HttpOnly',
+    'SameSite=Lax',
+    'Path=/',
+    'Max-Age=0',
+    secure ? 'Secure' : '',
+  ].filter(Boolean).join('; '));
+}
+
+function requireAuth(req: Request, res: Response, next: any) {
+  const user = getSessionUser(req);
+  if (!user) return res.status(401).json({ error: 'Sessão inválida ou expirada.' });
+  (req as any).authUser = user;
+  next();
+}
+
+function requireRole(...roles: MackEnadeRole[]) {
+  return (req: Request, res: Response, next: any) => {
+    const user = getSessionUser(req);
+    if (!user) return res.status(401).json({ error: 'Sessão inválida ou expirada.' });
+    if (!roles.includes(user.role)) return res.status(403).json({ error: 'Acesso não autorizado para este perfil.' });
+    (req as any).authUser = user;
+    next();
+  };
+}
+
+function userFromRequest(req: Request): PilotAuthUser | null {
+  return ((req as any).authUser as PilotAuthUser | undefined) || getSessionUser(req);
+}
+
 async function startServer() {
   const app = express();
-  const PORT = 3000;
+  const PORT = Number(process.env.PORT || 3000);
 
   app.use(express.json());
 
@@ -126,6 +232,32 @@ async function startServer() {
   let currentCompetencies = [...initialCompetencies];
   const currentAchievements = [...initialAchievements];
   const questionResultsHistory: any[] = [];
+  const studentStateByUserId = new Map<string, typeof initialStudent>();
+  const competencyStateByUserId = new Map<string, typeof initialCompetencies>();
+  const resultsByUserId = new Map<string, any[]>();
+
+  function getStudentRuntime(user: PilotAuthUser) {
+    const existing = studentStateByUserId.get(user.id);
+    if (existing) return existing;
+    const created = {
+      ...initialStudent,
+      id: user.id,
+      ra: user.id,
+      name: user.name,
+      email: user.institutionalEmail,
+      course: user.courseName,
+    };
+    studentStateByUserId.set(user.id, created);
+    return created;
+  }
+
+  function getCompetencyRuntime(user: PilotAuthUser) {
+    const existing = competencyStateByUserId.get(user.id);
+    if (existing) return existing;
+    const created = initialCompetencies.map((c) => ({ ...c }));
+    competencyStateByUserId.set(user.id, created);
+    return created;
+  }
 
   let currentQuestions: Question[] = sampleQuestions.map((q) => ({
     ...q,
@@ -175,125 +307,75 @@ async function startServer() {
   });
 
   // --------------------------------------------------------------------------
-  // PILOT AUTHENTICATION ENDPOINTS (GOOGLE SHEETS BACKED - NO MICROSOFT ENTRA)
+  // PILOT AUTHENTICATION ENDPOINTS (EMAIL + ACCESS CODE)
   // --------------------------------------------------------------------------
 
-  // Get current active session
   app.get('/api/auth/me', (req: Request, res: Response) => {
-    const user = authService.getCurrentUser();
-    if (!user) {
-      return res.status(401).json({ authenticated: false, user: null });
-    }
+    const user = getSessionUser(req);
+    if (!user) return res.status(401).json({ authenticated: false, user: null });
     res.json({ authenticated: true, user });
   });
 
-  // Pilot email + access code login against Google Sheets
   app.post('/api/auth/login', async (req: Request, res: Response) => {
     try {
-      const { email, accessCode, role } = req.body;
-      const clientIp =
-        (req.headers['x-forwarded-for'] as string) ||
-        req.ip ||
-        req.socket.remoteAddress ||
-        '127.0.0.1';
-
-      const user = await authService.login(email, accessCode, clientIp, role);
-
-      // Synchronize in-memory session user for existing features
-      if (user.role === 'STUDENT') {
-        currentStudent.name = user.name;
-        currentStudent.email = user.institutionalEmail;
-        currentStudent.course = user.courseName;
-      } else if (user.role === 'PROFESSOR' || user.role === 'COORDINATOR' || user.role === 'ADMIN') {
-        currentProfessor.name = user.name;
-        currentProfessor.email = user.institutionalEmail;
-        currentProfessor.course = user.courseName;
-      }
-
+      const { email, accessCode } = req.body || {};
+      const forwarded = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim();
+      const clientIp = forwarded || req.ip || req.socket.remoteAddress || '127.0.0.1';
+      const user = await authService.login(email, accessCode, clientIp);
+      setSessionCookie(req, res, user);
       const redirect =
-        user.role === 'PROFESSOR'
-          ? '/professor-dashboard'
-          : user.role === 'COORDINATOR' || user.role === 'ADMIN'
-          ? '/management-dashboard'
-          : '/dashboard';
-
-      res.json({
-        success: true,
-        user,
-        role: user.role,
-        redirect,
-      });
+        user.role === 'PROFESSOR' ? '/professor-dashboard' :
+        user.role === 'COORDINATOR' || user.role === 'ADMIN' ? '/management-dashboard' : '/dashboard';
+      res.json({ success: true, user, role: user.role, redirect });
     } catch (err: any) {
       const statusCode = err.statusCode || 401;
       res.status(statusCode).json({
-        error: err.userMessage || 'E-mail ou código de acesso inválido.',
-        message: err.userMessage || 'E-mail ou código de acesso inválido.',
-        secondaryMessage:
-          err.secondaryMessage || 'Verifique os dados informados e tente novamente.',
+        error: err.userMessage || err.message || 'E-mail ou código de acesso inválido.',
+        message: err.userMessage || err.message || 'E-mail ou código de acesso inválido.',
+        secondaryMessage: err.secondaryMessage || 'Verifique os dados informados e tente novamente.',
         code: err.code || 'INVALID_CREDENTIALS',
       });
     }
   });
 
-  // Logout
   app.post('/api/auth/logout', (req: Request, res: Response) => {
-    authService.logout();
+    clearSessionCookie(req, res);
     res.json({ success: true, message: 'Sessão encerrada com sucesso.' });
   });
 
-  // Pilot Authorized Users list (for Management/Coordinator inspection - NEVER exposes access_code)
-  app.get('/api/auth/users', async (req: Request, res: Response) => {
+  app.get('/api/auth/users', requireRole('COORDINATOR', 'ADMIN'), async (req: Request, res: Response) => {
     try {
-      const users = await authService.listUsersForAdmin();
-      res.json({ users });
-    } catch (err) {
+      res.json({ users: await authService.listUsersForAdmin() });
+    } catch {
       res.status(500).json({ error: 'Erro ao listar usuários do piloto' });
     }
   });
 
-  // Admin: list users with access status (NEVER exposes access_code)
-  app.get('/api/auth/admin/users', async (req: Request, res: Response) => {
+  app.get('/api/auth/admin/users', requireRole('COORDINATOR', 'ADMIN'), async (req: Request, res: Response) => {
     try {
-      const users = await authService.listUsersForAdmin();
-      res.json({ success: true, users });
-    } catch (err) {
+      res.json({ success: true, users: await authService.listUsersForAdmin() });
+    } catch {
       res.status(500).json({ error: 'Erro ao carregar diretório de acesso' });
     }
   });
 
-  // Admin: generate / regenerate access code
-  app.post('/api/auth/admin/generate-code', (req: Request, res: Response) => {
+  app.post('/api/auth/admin/generate-code', requireRole('COORDINATOR', 'ADMIN'), async (req: Request, res: Response) => {
     try {
-      const { email, role } = req.body;
-      if (!email) {
-        return res.status(400).json({ error: 'E-mail é obrigatório.' });
-      }
-      const result = authService.generateAccessCode(email, role);
-      res.json({
-        success: true,
-        message: 'Novo código de acesso gerado.',
-        email: result.email,
-        accessCode: result.accessCode, // Provided only to the administrator to copy
-      });
+      const { email, role } = req.body || {};
+      if (!email) return res.status(400).json({ error: 'E-mail é obrigatório.' });
+      const result = await authService.generateAccessCode(email, role);
+      res.json({ success: true, message: 'Novo código de acesso gerado.', ...result });
     } catch (err: any) {
       res.status(500).json({ error: err.message || 'Erro ao gerar código de acesso' });
     }
   });
 
-  // Admin: activate or deactivate login
-  app.post('/api/auth/admin/toggle-login', (req: Request, res: Response) => {
+  app.post('/api/auth/admin/toggle-login', requireRole('COORDINATOR', 'ADMIN'), async (req: Request, res: Response) => {
     try {
-      const { email, active, role } = req.body;
-      if (!email) {
-        return res.status(400).json({ error: 'E-mail é obrigatório.' });
-      }
-      authService.updateUserLoginActive(email, Boolean(active), role);
-      res.json({
-        success: true,
-        message: active ? 'Acesso ativado com sucesso.' : 'Acesso desativado com sucesso.',
-        email,
-        active: Boolean(active),
-      });
+      const { email, active, role } = req.body || {};
+      if (!email) return res.status(400).json({ error: 'E-mail é obrigatório.' });
+      await authService.updateUserLoginActive(email, Boolean(active), role);
+      res.json({ success: true, message: active ? 'Acesso ativado com sucesso.' : 'Acesso desativado com sucesso.', email, active: Boolean(active) });
     } catch (err: any) {
       res.status(500).json({ error: err.message || 'Erro ao alterar status de login' });
     }
@@ -333,13 +415,13 @@ async function startServer() {
   });
 
   // Refresh server-side Google Sheets cache
-  app.post('/api/cache/refresh', (req: Request, res: Response) => {
+  app.post('/api/cache/refresh', requireRole('COORDINATOR', 'ADMIN'), (req: Request, res: Response) => {
     googleSheetsService.clearCache();
     res.json({ success: true, message: 'Cache do Google Sheets renovado com sucesso.' });
   });
 
   // Coordinator Overview (pilot metrics from Google Sheets)
-  app.get('/api/coordinator/overview', async (req: Request, res: Response) => {
+  app.get('/api/coordinator/overview', requireRole('COORDINATOR', 'ADMIN'), async (req: Request, res: Response) => {
     try {
       const courses = await courseService.getCourses();
       const disciplines = await disciplineService.getDisciplines();
@@ -372,17 +454,27 @@ async function startServer() {
     }
   });
 
-  // Student profile
-  app.get('/api/student', (req: Request, res: Response) => {
-    res.json(currentStudent);
+  // Authenticated user profiles are derived from the signed session, never from a global current user.
+  app.get('/api/student', requireRole('STUDENT'), (req: Request, res: Response) => {
+    const user = userFromRequest(req)!;
+    res.json(getStudentRuntime(user));
   });
 
-  // Professor profile & overview
-  app.get(['/api/professor', '/api/professor/profile'], (req: Request, res: Response) => {
-    res.json(currentProfessor);
+  app.get(['/api/professor', '/api/professor/profile'], requireRole('PROFESSOR', 'COORDINATOR', 'ADMIN'), (req: Request, res: Response) => {
+    const user = userFromRequest(req)!;
+    res.json({
+      ...initialProfessor,
+      id: user.id,
+      name: user.name,
+      email: user.institutionalEmail,
+      course: user.courseName,
+      department: user.mentorArea || initialProfessor.department,
+    });
   });
 
-  app.get('/api/professor/overview', (req: Request, res: Response) => {
+  app.get('/api/professor/overview', requireRole('PROFESSOR', 'COORDINATOR', 'ADMIN'), (req: Request, res: Response) => {
+    const sessionUser = userFromRequest(req)!;
+    const professorProfile = { ...currentProfessor, id: sessionUser.id, name: sessionUser.name, email: sessionUser.institutionalEmail, course: sessionUser.courseName };
     const totalClassStudents = currentClassStudents.length;
     const avgScore = (
       currentClassStudents.reduce((acc, s) => acc + s.estimatedScore, 0) / totalClassStudents
@@ -392,7 +484,7 @@ async function startServer() {
     const draftQuestions = currentQuestions.filter((q) => q.status === 'draft').length;
 
     res.json({
-      professor: currentProfessor,
+      professor: professorProfile,
       totalStudents: 142,
       averageEstimatedScore: Number(avgScore),
       pendingDoubtsCount: pendingDoubts,
@@ -406,12 +498,12 @@ async function startServer() {
   });
 
   // Class progress (student list)
-  app.get('/api/professor/class-progress', (req: Request, res: Response) => {
+  app.get('/api/professor/class-progress', requireRole('PROFESSOR', 'COORDINATOR', 'ADMIN'), (req: Request, res: Response) => {
     res.json(currentClassStudents);
   });
 
   // Class performance
-  app.get('/api/professor/class-performance', (req: Request, res: Response) => {
+  app.get('/api/professor/class-performance', requireRole('PROFESSOR', 'COORDINATOR', 'ADMIN'), (req: Request, res: Response) => {
     res.json({
       competencies: currentCompetencies,
       students: currentClassStudents,
@@ -422,19 +514,20 @@ async function startServer() {
   });
 
   // Professor Tips
-  app.get('/api/professor/tips', (req: Request, res: Response) => {
+  app.get('/api/professor/tips', requireAuth, (req: Request, res: Response) => {
     res.json(currentProfessorTips);
   });
 
-  app.post('/api/professor/tips', (req: Request, res: Response) => {
+  app.post('/api/professor/tips', requireRole('PROFESSOR', 'COORDINATOR', 'ADMIN'), (req: Request, res: Response) => {
+    const sessionUser = userFromRequest(req)!;
     const { title, content, competency, area } = req.body;
     if (!title || !content) {
       return res.status(400).json({ error: 'Título e conteúdo são obrigatórios' });
     }
     const newTip = {
       id: 'tip-' + Date.now(),
-      professorId: currentProfessor.id,
-      professorName: `${currentProfessor.title} ${currentProfessor.name}`,
+      professorId: sessionUser.id,
+      professorName: sessionUser.name,
       title,
       content,
       competency: competency || 'Formação Geral',
@@ -444,23 +537,24 @@ async function startServer() {
       readsCount: 0,
     };
     currentProfessorTips.unshift(newTip);
-    currentProfessor.publishedTipsCount += 1;
     res.status(201).json(newTip);
   });
 
   // Student Doubts & Answers
-  app.get('/api/professor/doubts', (req: Request, res: Response) => {
+  app.get('/api/professor/doubts', requireAuth, (req: Request, res: Response) => {
     res.json(currentStudentDoubts);
   });
 
-  app.post('/api/professor/doubts', (req: Request, res: Response) => {
+  app.post('/api/professor/doubts', requireRole('STUDENT'), (req: Request, res: Response) => {
+    const sessionUser = userFromRequest(req)!;
+    const studentRuntime = getStudentRuntime(sessionUser);
     const { topic, questionTitle, doubtText, questionId } = req.body;
     const newDoubt = {
       id: 'doubt-' + Date.now(),
-      studentId: currentStudent.id,
-      studentName: currentStudent.name,
-      studentRa: currentStudent.ra,
-      course: currentStudent.course,
+      studentId: sessionUser.id,
+      studentName: sessionUser.name,
+      studentRa: studentRuntime.ra,
+      course: sessionUser.courseName,
       questionId,
       topic: topic || 'Dúvida Geral',
       questionTitle: questionTitle || 'Dúvida enviada pelo estudante',
@@ -472,7 +566,8 @@ async function startServer() {
     res.status(201).json(newDoubt);
   });
 
-  app.post('/api/professor/doubts/:id/answer', (req: Request, res: Response) => {
+  app.post('/api/professor/doubts/:id/answer', requireRole('PROFESSOR', 'COORDINATOR', 'ADMIN'), (req: Request, res: Response) => {
+    const sessionUser = userFromRequest(req)!;
     const { id } = req.params;
     const { answerText, answer } = req.body;
     const doubt = currentStudentDoubts.find((d) => d.id === id);
@@ -481,25 +576,25 @@ async function startServer() {
     }
     doubt.status = 'answered';
     doubt.answer = {
-      professorName: `${currentProfessor.title} ${currentProfessor.name}`,
+      professorName: sessionUser.name,
       answerText: answerText || answer || 'Resposta registrada pelo docente.',
       answeredAt: 'Hoje',
     };
-    currentProfessor.answeredDoubtsCount += 1;
     res.json(doubt);
   });
 
   // Mentor Challenges
-  app.get(['/api/professor/challenges', '/api/professor/mentor-challenges'], (req: Request, res: Response) => {
+  app.get(['/api/professor/challenges', '/api/professor/mentor-challenges'], requireAuth, (req: Request, res: Response) => {
     res.json(currentMentorChallenges);
   });
 
-  app.post(['/api/professor/challenges', '/api/professor/mentor-challenges'], (req: Request, res: Response) => {
+  app.post(['/api/professor/challenges', '/api/professor/mentor-challenges'], requireRole('PROFESSOR', 'COORDINATOR', 'ADMIN'), (req: Request, res: Response) => {
+    const sessionUser = userFromRequest(req)!;
     const { title, description, competency, targetCount, targetQuestionCount, xpReward, rewardBadge, deadline } = req.body;
     const newChallenge = {
       id: 'm-chal-' + Date.now(),
-      professorId: currentProfessor.id,
-      professorName: `${currentProfessor.title} ${currentProfessor.name}`,
+      professorId: sessionUser.id,
+      professorName: sessionUser.name,
       title: title || 'Desafio do Mentor',
       description: description || 'Desafio criado pelo docente para reforço no ENADE.',
       competency: competency || 'Componente Específico',
@@ -512,16 +607,15 @@ async function startServer() {
       status: 'active' as const,
     };
     currentMentorChallenges.unshift(newChallenge);
-    currentProfessor.activeChallenges += 1;
     res.status(201).json(newChallenge);
   });
 
   // Boss Battle
-  app.get('/api/professor/boss-battle', (req: Request, res: Response) => {
+  app.get('/api/professor/boss-battle', requireAuth, (req: Request, res: Response) => {
     res.json(currentBossBattle);
   });
 
-  app.post('/api/professor/boss-battle/damage', (req: Request, res: Response) => {
+  app.post('/api/professor/boss-battle/damage', requireRole('STUDENT'), (req: Request, res: Response) => {
     const { damage = 150 } = req.body;
     const newHp = Math.max(0, currentBossBattle.currentHp - damage);
     currentBossBattle.currentHp = newHp;
@@ -532,53 +626,42 @@ async function startServer() {
   });
 
   // Mentor Hour
-  app.get('/api/professor/mentor-hour', (req: Request, res: Response) => {
+  app.get('/api/professor/mentor-hour', requireAuth, (req: Request, res: Response) => {
     res.json(currentMentorHourSession);
   });
 
-  app.post('/api/professor/mentor-hour/toggle', (req: Request, res: Response) => {
+  app.post('/api/professor/mentor-hour/toggle', requireRole('PROFESSOR', 'COORDINATOR', 'ADMIN'), (req: Request, res: Response) => {
     currentMentorHourSession.status =
       currentMentorHourSession.status === 'live' ? 'scheduled' : 'live';
     res.json(currentMentorHourSession);
   });
 
   // Institutional Achievements (Social Sharing)
-  app.get(['/api/professor/achievements', '/api/professor/institutional-achievements'], (req: Request, res: Response) => {
+  app.get(['/api/professor/achievements', '/api/professor/institutional-achievements'], requireAuth, (req: Request, res: Response) => {
     res.json(currentInstitutionalAchievements);
   });
 
   // Question results history
-  app.get('/api/results', (req: Request, res: Response) => {
-    res.json(questionResultsHistory);
+  app.get('/api/results', requireRole('STUDENT'), (req: Request, res: Response) => {
+    const user = userFromRequest(req)!;
+    res.json(resultsByUserId.get(user.id) || []);
   });
 
-  // Login simulation
-  app.post('/api/login', (req: Request, res: Response) => {
-    const { email, password, course, role = 'student' } = req.body;
-    if (course) {
-      currentStudent.course = course;
-    }
-    res.json({
-      success: true,
-      token: 'mack-mock-token-' + Date.now(),
-      role,
-      student: currentStudent,
-      professor: currentProfessor,
-    });
-  });
+
 
   // Missions
-  app.get('/api/missions', (req: Request, res: Response) => {
+  app.get('/api/missions', requireAuth, (req: Request, res: Response) => {
     res.json(currentMissions);
   });
 
   // Competencies
-  app.get('/api/competencies', (req: Request, res: Response) => {
-    res.json(currentCompetencies);
+  app.get('/api/competencies', requireAuth, (req: Request, res: Response) => {
+    const user = userFromRequest(req)!;
+    res.json(user.role === 'STUDENT' ? getCompetencyRuntime(user) : currentCompetencies);
   });
 
   // Recommended Activity
-  app.get('/api/recommended-activity', (req: Request, res: Response) => {
+  app.get('/api/recommended-activity', requireAuth, (req: Request, res: Response) => {
     res.json(recommendedActivity);
   });
 
@@ -587,7 +670,7 @@ async function startServer() {
   // --------------------------------------------------------------------------
 
   // List questions with filtering and student governance
-  app.get('/api/questions', async (req: Request, res: Response) => {
+  app.get('/api/questions', requireAuth, async (req: Request, res: Response) => {
     try {
       const {
         course_id,
@@ -603,16 +686,14 @@ async function startServer() {
         includeDrafts,
       } = req.query;
 
-      // Identify requestor role: if authenticated as student or role='STUDENT', enforce governance
-      const currentUser = authService.getCurrentUser();
-      const effectiveRole: MackEnadeRole =
-        (role as MackEnadeRole) || (currentUser?.role ?? 'STUDENT');
+      // Role and course always come from the authenticated server session.
+      const sessionUser = userFromRequest(req)!;
+      const effectiveRole: MackEnadeRole = sessionUser.role;
 
-      const filters: any = {
-        role: effectiveRole,
-      };
+      const filters: any = { role: effectiveRole };
 
-      if (course_id) filters.course_id = String(course_id);
+      if (effectiveRole === 'STUDENT') filters.course_id = sessionUser.courseId;
+      else if (course_id) filters.course_id = String(course_id);
       if (discipline_id) filters.discipline_id = String(discipline_id);
       if (difficulty) filters.difficulty = String(difficulty);
       if (question_type) filters.question_type = String(question_type);
@@ -628,63 +709,39 @@ async function startServer() {
       // Map to full client format
       const formattedSheetQuestions = sheetQuestions.map(formatQuestionForClient);
 
-      // Also incorporate in-memory questions if relevant
-      let localPool = currentQuestions;
-      if (effectiveRole === 'STUDENT') {
-        localPool = currentQuestions.filter((q) => q.status === 'published');
-      } else if (includeDrafts !== 'true' && !review_status) {
-        // Professor view without includeDrafts
-      }
-
-      // Combine Google Sheets questions first, then unique local questions
-      const seenIds = new Set<string>();
-      const combined: (Question & Record<string, any>)[] = [];
-
-      for (const q of formattedSheetQuestions) {
-        if (!seenIds.has(q.id)) {
-          seenIds.add(q.id);
-          combined.push(q);
-        }
-      }
-
-      for (const q of localPool) {
-        if (!seenIds.has(q.id)) {
-          seenIds.add(q.id);
-          combined.push(q);
-        }
-      }
-
-      res.json(combined);
+      // In PILOT/PRODUCTION Google Sheets is the source of truth.
+      res.json(formattedSheetQuestions);
     } catch (err) {
       console.error('Error fetching questions:', err);
-      res.json(currentQuestions.filter((q) => q.status === 'published'));
+      res.status(500).json({ error: 'Não foi possível carregar as questões neste momento.' });
     }
   });
 
   // Get question by ID
-  app.get('/api/questions/:id', async (req: Request, res: Response) => {
+  app.get('/api/questions/:id', requireAuth, async (req: Request, res: Response) => {
     try {
       const qId = req.params.id;
+      const sessionUser = userFromRequest(req)!;
       const sheetQ = await questionService.getQuestionById(qId);
-      if (sheetQ) {
-        return res.json(formatQuestionForClient(sheetQ));
+      if (!sheetQ) return res.status(404).json({ error: 'Questão não encontrada' });
+      if (sessionUser.role === 'STUDENT') {
+        const allowedCourse = !sheetQ.course_id || ['BOTH', sessionUser.courseId].includes(sheetQ.course_id);
+        if (!sheetQ.active || sheetQ.review_status !== 'APPROVED' || !allowedCourse) {
+          return res.status(404).json({ error: 'Questão não encontrada' });
+        }
       }
-      const localQ = currentQuestions.find((q) => q.id === qId);
-      if (localQ) {
-        return res.json(localQ);
-      }
-      res.status(404).json({ error: 'Questão não encontrada' });
+      return res.json(formatQuestionForClient(sheetQ));
     } catch (err) {
       res.status(500).json({ error: 'Erro ao buscar questão' });
     }
   });
 
   // Create question (Professor creation - defaults to DRAFT, active: false)
-  app.post(['/api/questions', '/api/professor/questions'], async (req: Request, res: Response) => {
+  app.post(['/api/questions', '/api/professor/questions'], requireRole('PROFESSOR', 'COORDINATOR', 'ADMIN'), async (req: Request, res: Response) => {
     try {
       const qData = req.body;
-      const currentUser = authService.getCurrentUser();
-      const professorId = currentUser?.id || currentProfessor.id || 'prof-upm';
+      const sessionUser = userFromRequest(req)!;
+      const professorId = sessionUser.id;
 
       // Map alternatives if array provided
       let altA = qData.alternative_a || '';
@@ -744,6 +801,7 @@ async function startServer() {
   // Submit question for institutional review (review_status = PENDING_REVIEW)
   app.post(
     ['/api/questions/:id/submit-review', '/api/professor/questions/:id/submit-review'],
+    requireRole('PROFESSOR', 'COORDINATOR', 'ADMIN'),
     async (req: Request, res: Response) => {
       try {
         const { id } = req.params;
@@ -771,11 +829,12 @@ async function startServer() {
   // Approve question (review_status = APPROVED, active = true)
   app.post(
     ['/api/questions/:id/approve', '/api/professor/questions/:id/approve'],
+    requireRole('COORDINATOR', 'ADMIN'),
     async (req: Request, res: Response) => {
       try {
         const { id } = req.params;
-        const currentUser = authService.getCurrentUser();
-        const reviewer = currentUser?.name || 'Coordenação ENADE / NDE';
+        const sessionUser = userFromRequest(req)!;
+        const reviewer = sessionUser.name;
         const updated = await questionService.approveQuestion(id, reviewer);
         const formatted = formatQuestionForClient(updated);
 
@@ -800,6 +859,7 @@ async function startServer() {
   // Update question
   app.patch(
     ['/api/questions/:id', '/api/professor/questions/:id'],
+    requireRole('PROFESSOR', 'COORDINATOR', 'ADMIN'),
     async (req: Request, res: Response) => {
       const { id } = req.params;
       try {
@@ -821,18 +881,24 @@ async function startServer() {
     }
   );
 
-  // Delete question
+  // Soft-delete question in the Google Sheet to preserve audit history.
   app.delete(
     ['/api/questions/:id', '/api/professor/questions/:id'],
-    (req: Request, res: Response) => {
-      const { id } = req.params;
-      currentQuestions = currentQuestions.filter((q) => q.id !== id);
-      res.json({ success: true, message: 'Questão excluída com sucesso.' });
+    requireRole('COORDINATOR', 'ADMIN'),
+    async (req: Request, res: Response) => {
+      try {
+        const { id } = req.params;
+        await questionService.updateQuestion(id, { active: false, review_status: 'REJECTED' });
+        res.json({ success: true, message: 'Questão desativada com sucesso.' });
+      } catch (err: any) {
+        res.status(404).json({ error: err.message || 'Questão não encontrada.' });
+      }
     }
   );
 
   // AI Generation with Gemini (sets status to 'draft')
-  app.post('/api/gemini/generate-question', async (req: Request, res: Response) => {
+  app.post('/api/gemini/generate-question', requireRole('PROFESSOR', 'COORDINATOR', 'ADMIN'), async (req: Request, res: Response) => {
+    const sessionUser = userFromRequest(req)!;
     const {
       topic = 'Estruturas de Dados e Algoritmos',
       area = 'Componente Específico',
@@ -908,7 +974,7 @@ Responda ESTRITAMENTE em formato JSON com a seguinte estrutura:
           correct_answer: (parsed.correctAnswer || 'A').toUpperCase() as any,
           explanation: parsed.explanation,
           common_error: parsed.commonError,
-        });
+        }, sessionUser.id);
 
         const formatted = formatQuestionForClient(sheetAiQ);
         currentQuestions.unshift(formatted);
@@ -998,12 +1064,29 @@ A anomalia descrita e o nível de isolamento mínimo ANSI SQL capaz de impedi-la
       },
     };
 
-    currentQuestions.unshift(aiQuestion);
-    res.status(201).json(aiQuestion);
+    const fallbackSheetQuestion = await questionService.createAiQuestion({
+      course_id: course.includes('Civil') ? 'CIVIL' : 'PROD',
+      discipline_id: course.includes('Civil') ? 'CIV-01' : 'PROD-01',
+      enade_component: area.includes('Geral') ? 'GENERAL' : 'SPECIFIC',
+      topic: aiQuestion.topic,
+      competency: aiQuestion.competency,
+      difficulty: difficulty.includes('Fácil') ? 'EASY' : difficulty.includes('Difícil') ? 'HARD' : 'MEDIUM',
+      statement: aiQuestion.statement,
+      alternative_a: aiQuestion.alternatives[0]?.text || '',
+      alternative_b: aiQuestion.alternatives[1]?.text || '',
+      alternative_c: aiQuestion.alternatives[2]?.text || '',
+      alternative_d: aiQuestion.alternatives[3]?.text || '',
+      alternative_e: aiQuestion.alternatives[4]?.text || '',
+      correct_answer: aiQuestion.correctAnswer,
+      explanation: aiQuestion.explanation,
+      common_error: aiQuestion.commonError,
+    }, sessionUser.id);
+    res.status(201).json(formatQuestionForClient(fallbackSheetQuestion));
   });
 
   // Generate question from uploaded educational material
-  app.post('/api/gemini/generate-from-material', async (req: Request, res: Response) => {
+  app.post('/api/gemini/generate-from-material', requireRole('PROFESSOR', 'COORDINATOR', 'ADMIN'), async (req: Request, res: Response) => {
+    const sessionUser = userFromRequest(req)!;
     const { materialText, fileName, competency, area, course = 'Ciência da Computação' } = req.body;
 
     if (!materialText || materialText.trim().length < 20) {
@@ -1077,8 +1160,25 @@ Estruture a resposta em formato JSON:
           },
         };
 
-        currentQuestions.unshift(aiQuestion);
-        return res.status(201).json(aiQuestion);
+        const saved = await questionService.createAiQuestion({
+          course_id: course.includes('Civil') ? 'CIVIL' : 'PROD',
+          discipline_id: course.includes('Civil') ? 'CIV-01' : 'PROD-01',
+          enade_component: (area || '').includes('Geral') ? 'GENERAL' : 'SPECIFIC',
+          topic: aiQuestion.topic,
+          competency: aiQuestion.competency,
+          difficulty: 'MEDIUM',
+          statement: aiQuestion.statement,
+          alternative_a: aiQuestion.alternatives[0]?.text || '',
+          alternative_b: aiQuestion.alternatives[1]?.text || '',
+          alternative_c: aiQuestion.alternatives[2]?.text || '',
+          alternative_d: aiQuestion.alternatives[3]?.text || '',
+          alternative_e: aiQuestion.alternatives[4]?.text || '',
+          correct_answer: aiQuestion.correctAnswer,
+          explanation: aiQuestion.explanation,
+          common_error: aiQuestion.commonError,
+          source: aiQuestion.source,
+        }, sessionUser.id);
+        return res.status(201).json(formatQuestionForClient(saved));
       } catch (err) {
         console.error('Gemini material generation error, using fallback:', err);
       }
@@ -1120,104 +1220,103 @@ Estruture a resposta em formato JSON:
       },
     };
 
-    currentQuestions.unshift(fallbackQuestion);
-    res.status(201).json(fallbackQuestion);
+    const savedFallback = await questionService.createAiQuestion({
+      course_id: course.includes('Civil') ? 'CIVIL' : 'PROD',
+      discipline_id: course.includes('Civil') ? 'CIV-01' : 'PROD-01',
+      enade_component: (area || '').includes('Geral') ? 'GENERAL' : 'SPECIFIC',
+      topic: fallbackQuestion.topic,
+      competency: fallbackQuestion.competency,
+      difficulty: 'MEDIUM',
+      statement: fallbackQuestion.statement,
+      alternative_a: fallbackQuestion.alternatives[0]?.text || '',
+      alternative_b: fallbackQuestion.alternatives[1]?.text || '',
+      alternative_c: fallbackQuestion.alternatives[2]?.text || '',
+      alternative_d: fallbackQuestion.alternatives[3]?.text || '',
+      alternative_e: fallbackQuestion.alternatives[4]?.text || '',
+      correct_answer: fallbackQuestion.correctAnswer,
+      explanation: fallbackQuestion.explanation,
+      common_error: fallbackQuestion.commonError,
+      source: fallbackQuestion.source,
+    }, sessionUser.id);
+    res.status(201).json(formatQuestionForClient(savedFallback));
   });
 
-  // Submit Answer
-  app.post('/api/answer-question', (req: Request, res: Response) => {
-    const { questionId, selectedAlternative } = req.body;
-    const question = currentQuestions.find((q) => q.id === questionId);
+  // Submit Answer - isolated per authenticated student session
+  app.post('/api/answer-question', requireRole('STUDENT'), async (req: Request, res: Response) => {
+    const user = userFromRequest(req)!;
+    const { questionId, selectedAlternative, alternative } = req.body || {};
+    const chosenAlternative = selectedAlternative || alternative;
 
-    if (!question) {
-      return res.status(404).json({ error: 'Questão não encontrada' });
+    const sheetQuestion = await questionService.getQuestionById(questionId);
+    if (!sheetQuestion || !sheetQuestion.active || sheetQuestion.review_status !== 'APPROVED') {
+      return res.status(404).json({ error: 'Questão não encontrada ou indisponível.' });
+    }
+    if (sheetQuestion.course_id && !['BOTH', user.courseId].includes(sheetQuestion.course_id)) {
+      return res.status(403).json({ error: 'Questão não disponível para este curso.' });
     }
 
-    const isCorrect = question.correctAnswer === selectedAlternative;
+    const question = formatQuestionForClient(sheetQuestion);
+    const isCorrect = question.correctAnswer === chosenAlternative;
     const isMentorHourLive = currentMentorHourSession.status === 'live';
     const multiplier = isMentorHourLive ? currentMentorHourSession.xpMultiplier : 1;
     const baseEarnedXp = isCorrect ? 50 : 15;
     const earnedXp = Math.round(baseEarnedXp * multiplier);
 
-    // Update Boss Battle if correct
     if (isCorrect) {
-      currentBossBattle.currentHp = Math.max(
-        0,
-        currentBossBattle.currentHp - currentBossBattle.damagePerCorrectAnswer
-      );
-      if (currentBossBattle.currentHp === 0) {
-        currentBossBattle.status = 'defeated';
-      }
+      currentBossBattle.currentHp = Math.max(0, currentBossBattle.currentHp - currentBossBattle.damagePerCorrectAnswer);
+      if (currentBossBattle.currentHp === 0) currentBossBattle.status = 'defeated';
     }
 
-    // Update question analytics
-    if (question.analytics) {
-      question.analytics.attempts += 1;
-      if (isCorrect) question.analytics.correctCount += 1;
-      question.analytics.accuracyRate = +(
-        (question.analytics.correctCount / question.analytics.attempts) *
-        100
-      ).toFixed(1);
-      if (
-        selectedAlternative &&
-        question.analytics.distractorSelections &&
-        question.analytics.distractorSelections[selectedAlternative as 'A' | 'B' | 'C' | 'D' | 'E'] !== undefined
-      ) {
-        question.analytics.distractorSelections[selectedAlternative as 'A' | 'B' | 'C' | 'D' | 'E'] += 1;
-      }
-    }
-
-    const newAnswered = currentStudent.questionsAnswered + 1;
-    const newCorrect = isCorrect ? currentStudent.correctAnswers + 1 : currentStudent.correctAnswers;
+    const studentState = getStudentRuntime(user);
+    const newAnswered = studentState.questionsAnswered + 1;
+    const newCorrect = isCorrect ? studentState.correctAnswers + 1 : studentState.correctAnswers;
     const accuracy = newCorrect / newAnswered;
     const calculatedScore = +(1.0 + accuracy * 4.0).toFixed(1);
     const calculatedPrep = Math.min(100, Math.round((newAnswered / 30) * 85));
-
-    currentStudent = {
-      ...currentStudent,
-      xp: currentStudent.xp + earnedXp,
+    const updatedStudent = {
+      ...studentState,
+      xp: studentState.xp + earnedXp,
       questionsAnswered: newAnswered,
       correctAnswers: newCorrect,
       estimatedScore: calculatedScore,
-      enadePreparationPercentage: Math.max(currentStudent.enadePreparationPercentage, calculatedPrep),
+      enadePreparationPercentage: Math.max(studentState.enadePreparationPercentage, calculatedPrep),
     };
-
-    // Recalculate level if XP exceeds threshold
-    if (currentStudent.xp >= currentStudent.nextLevelXp) {
-      currentStudent.level += 1;
-      currentStudent.nextLevelXp += 1000;
+    if (updatedStudent.xp >= updatedStudent.nextLevelXp) {
+      updatedStudent.level += 1;
+      updatedStudent.nextLevelXp += 1000;
     }
+    studentStateByUserId.set(user.id, updatedStudent);
 
-    // Update competency performance
-    currentCompetencies = currentCompetencies.map((comp) => {
+    const competencies = getCompetencyRuntime(user).map((comp) => {
       if (comp.name === question.competency || comp.area === question.area) {
-        const updatedResolved = comp.questionsResolved + 1;
         const adjustment = isCorrect ? 4 : -2;
-        const newPerformance = Math.min(98, Math.max(25, comp.performancePercentage + adjustment));
         return {
           ...comp,
-          questionsResolved: updatedResolved,
-          performancePercentage: newPerformance,
+          questionsResolved: comp.questionsResolved + 1,
+          performancePercentage: Math.min(98, Math.max(25, comp.performancePercentage + adjustment)),
         };
       }
       return comp;
     });
+    competencyStateByUserId.set(user.id, competencies);
 
-    // Record result history
     const resultRecord = {
       id: 'res-' + Date.now(),
+      userId: user.id,
       questionId,
       course: question.course,
       area: question.area,
       competency: question.competency,
       topic: question.topic,
-      selectedAlternative,
+      selectedAlternative: chosenAlternative,
       correctAnswer: question.correctAnswer,
       isCorrect,
       earnedXp,
       timestamp: new Date().toISOString(),
     };
-    questionResultsHistory.unshift(resultRecord);
+    const history = resultsByUserId.get(user.id) || [];
+    history.unshift(resultRecord);
+    resultsByUserId.set(user.id, history.slice(0, 200));
 
     res.json({
       success: true,
@@ -1227,19 +1326,22 @@ Estruture a resposta em formato JSON:
       explanation: question.explanation,
       commonError: question.commonError,
       keyTakeaway: question.keyTakeaway,
-      student: currentStudent,
-      competencies: currentCompetencies,
+      student: updatedStudent,
+      competencies,
       result: resultRecord,
+      bossDamageDealt: isCorrect ? currentBossBattle.damagePerCorrectAnswer : 0,
+      isMentorHourActive: isMentorHourLive,
     });
   });
 
+
   // Achievements
-  app.get('/api/achievements', (req: Request, res: Response) => {
+  app.get('/api/achievements', requireAuth, (req: Request, res: Response) => {
     res.json(currentAchievements);
   });
 
   // Simulation exams
-  app.get('/api/simulation-exams', (req: Request, res: Response) => {
+  app.get('/api/simulation-exams', requireAuth, (req: Request, res: Response) => {
     res.json(simulationExams);
   });
 
@@ -1257,17 +1359,27 @@ Estruture a resposta em formato JSON:
    * - refresh: 'true' (force bypass cache)
    * - include_dates: 'true'/'false'
    */
-  app.get('/api/prizes', async (req: Request, res: Response) => {
+  app.get('/api/prizes', requireAuth, async (req: Request, res: Response) => {
     try {
       const forceRefresh = req.query.refresh === 'true';
       const allPrizes = await googleSheetsService.getPrizes(forceRefresh);
 
       const { course_id, status, active, include_dates } = req.query;
+      const sessionUser = userFromRequest(req)!;
 
       let filtered = [...allPrizes];
 
+      // Students only receive currently active rewards for their own course.
+      if (sessionUser.role === 'STUDENT') {
+        filtered = filtered.filter((p) => p.active && (p.status || '').toUpperCase() === 'ACTIVE');
+        filtered = filtered.filter((p) => {
+          const prizeCourse = (p.course_id || 'ALL').toUpperCase();
+          return ['ALL', 'BOTH', ''].includes(prizeCourse) || prizeCourse === sessionUser.courseId.toUpperCase();
+        });
+      }
+
       // 1. Filter by active boolean
-      if (active !== undefined && active !== 'ALL') {
+      if (sessionUser.role !== 'STUDENT' && active !== undefined && active !== 'ALL') {
         const wantActive =
           active === 'true' ||
           active === 'TRUE' ||
@@ -1278,7 +1390,7 @@ Estruture a resposta em formato JSON:
       }
 
       // 2. Filter by status (e.g. ACTIVE, DRAFT, ARCHIVED)
-      if (status !== undefined && status !== 'ALL') {
+      if (sessionUser.role !== 'STUDENT' && status !== undefined && status !== 'ALL') {
         const wantStatus = String(status).trim().toUpperCase();
         filtered = filtered.filter((p) => (p.status || '').toUpperCase() === wantStatus);
       }
@@ -1287,7 +1399,7 @@ Estruture a resposta em formato JSON:
       // If course_id = ALL, show to both Civil Engineering and Production Engineering students.
       // If course_id = CIVIL, show only to Civil Engineering students.
       // If course_id = PROD, show only to Production Engineering students.
-      if (course_id && course_id !== 'ALL') {
+      if (sessionUser.role !== 'STUDENT' && course_id && course_id !== 'ALL') {
         const targetCourse = String(course_id).trim().toUpperCase();
         filtered = filtered.filter((p) => {
           const prizeCourse = (p.course_id || 'ALL').trim().toUpperCase();
@@ -1329,7 +1441,7 @@ Estruture a resposta em formato JSON:
    * POST /api/prizes/:id/toggle-active
    * Coordinator / Admin utility to toggle active status or publish a prize for the pilot
    */
-  app.post('/api/prizes/:id/toggle-active', async (req: Request, res: Response) => {
+  app.post('/api/prizes/:id/toggle-active', requireRole('COORDINATOR', 'ADMIN'), async (req: Request, res: Response) => {
     try {
       const prizeId = req.params.id;
       const all = await googleSheetsService.getPrizes();
@@ -1340,7 +1452,7 @@ Estruture a resposta em formato JSON:
 
       const nextActive = req.body.active !== undefined ? Boolean(req.body.active) : !existing.active;
       const nextStatus = nextActive ? 'ACTIVE' : 'DRAFT';
-      const updated = googleSheetsService.updatePrize(prizeId, {
+      const updated = await googleSheetsService.updatePrize(prizeId, {
         active: nextActive,
         status: nextStatus,
       });
@@ -1359,10 +1471,10 @@ Estruture a resposta em formato JSON:
    * PUT /api/prizes/:id
    * Update prize details (in-memory overlay for pilot testing)
    */
-  app.put('/api/prizes/:id', async (req: Request, res: Response) => {
+  app.put('/api/prizes/:id', requireRole('COORDINATOR', 'ADMIN'), async (req: Request, res: Response) => {
     try {
       const prizeId = req.params.id;
-      const updated = googleSheetsService.updatePrize(prizeId, req.body);
+      const updated = await googleSheetsService.updatePrize(prizeId, req.body);
       res.json({ success: true, prize: updated });
     } catch (err: any) {
       res.status(500).json({ error: err.message });
@@ -1370,12 +1482,12 @@ Estruture a resposta em formato JSON:
   });
 
   // Get all reward campaigns
-  app.get('/api/rewards/campaigns', (req: Request, res: Response) => {
+  app.get('/api/rewards/campaigns', requireAuth, (req: Request, res: Response) => {
     res.json(currentRewardCampaigns);
   });
 
   // Create a new reward campaign (Administrator / Coordinator / Professor)
-  app.post('/api/rewards/campaigns', (req: Request, res: Response) => {
+  app.post('/api/rewards/campaigns', requireRole('PROFESSOR', 'COORDINATOR', 'ADMIN'), (req: Request, res: Response) => {
     const {
       title,
       category,
@@ -1439,7 +1551,7 @@ Estruture a resposta em formato JSON:
   });
 
   // Update a reward campaign
-  app.put('/api/rewards/campaigns/:id', (req: Request, res: Response) => {
+  app.put('/api/rewards/campaigns/:id', requireRole('COORDINATOR', 'ADMIN'), (req: Request, res: Response) => {
     const { id } = req.params;
     const index = currentRewardCampaigns.findIndex((c) => c.id === id);
     if (index === -1) {
@@ -1455,24 +1567,24 @@ Estruture a resposta em formato JSON:
   });
 
   // Delete a reward campaign
-  app.delete('/api/rewards/campaigns/:id', (req: Request, res: Response) => {
+  app.delete('/api/rewards/campaigns/:id', requireRole('COORDINATOR', 'ADMIN'), (req: Request, res: Response) => {
     const { id } = req.params;
     currentRewardCampaigns = currentRewardCampaigns.filter((c) => c.id !== id);
     res.json({ success: true, message: 'Campanha removida com sucesso.' });
   });
 
   // Get weekly winners
-  app.get('/api/rewards/winners', (req: Request, res: Response) => {
+  app.get('/api/rewards/winners', requireAuth, (req: Request, res: Response) => {
     res.json(currentRewardWinners);
   });
 
   // Get collective class rewards
-  app.get('/api/rewards/collective', (req: Request, res: Response) => {
+  app.get('/api/rewards/collective', requireAuth, (req: Request, res: Response) => {
     res.json(currentCollectiveClassRewards);
   });
 
   // Update collective class reward (e.g. contribution progress)
-  app.put('/api/rewards/collective/:id', (req: Request, res: Response) => {
+  app.put('/api/rewards/collective/:id', requireRole('COORDINATOR', 'ADMIN'), (req: Request, res: Response) => {
     const { id } = req.params;
     const index = currentCollectiveClassRewards.findIndex((c) => c.id === id);
     if (index === -1) {
@@ -1488,7 +1600,7 @@ Estruture a resposta em formato JSON:
   });
 
   // Draw or award winners for a campaign
-  app.post('/api/rewards/draw-winners', (req: Request, res: Response) => {
+  app.post('/api/rewards/draw-winners', requireRole('COORDINATOR', 'ADMIN'), (req: Request, res: Response) => {
     const { campaignId, studentIds } = req.body;
     const campaign = currentRewardCampaigns.find((c) => c.id === campaignId);
     if (!campaign) {
@@ -1528,7 +1640,7 @@ Estruture a resposta em formato JSON:
   });
 
   // Claim voucher
-  app.post('/api/rewards/claim-voucher', (req: Request, res: Response) => {
+  app.post('/api/rewards/claim-voucher', requireAuth, (req: Request, res: Response) => {
     const { voucherCode } = req.body;
     const winner = currentRewardWinners.find((w) => w.voucherCode === voucherCode);
     if (winner) {

@@ -16,6 +16,7 @@ import {
   QuestionResult,
   UserRole,
   Professor,
+  InternalUserProfile,
 } from './types';
 import {
   initialStudent,
@@ -49,16 +50,20 @@ import { ProfessorClassPerformanceScreen } from './screens/ProfessorClassPerform
 import { ProfessorChallengesScreen } from './screens/ProfessorChallengesScreen';
 import { ProfessorRewardManagerScreen } from './screens/ProfessorRewardManagerScreen';
 import { SocialShareScreen } from './screens/SocialShareScreen';
+import { ManagementDashboardScreen } from './screens/ManagementDashboardScreen';
 
 
 // Navigation
 import { Navigation } from './components/Navigation';
 import { PWAController } from './components/PWAController';
+import { checkCurrentSession, logoutSession } from './services/pilotAuth';
 
 export default function App() {
-  const [isLoggedIn, setIsLoggedIn] = useState(true);
+  const [isLoggedIn, setIsLoggedIn] = useState(false);
+  const [isCheckingSession, setIsCheckingSession] = useState(true);
+  const [currentUser, setCurrentUser] = useState<InternalUserProfile | null>(null);
   const [userRole, setUserRole] = useState<UserRole>('student');
-  const [currentScreen, setCurrentScreen] = useState<ScreenType>('dashboard');
+  const [currentScreen, setCurrentScreen] = useState<ScreenType>('login');
 
   // Application state
   const [student, setStudent] = useState<Student>(initialStudent);
@@ -92,31 +97,41 @@ export default function App() {
     }, 3500);
   };
 
-  // Sync state with server API
+  // Restore only a server-validated HttpOnly-cookie session.
   useEffect(() => {
-    fetch('/api/student')
-      .then((res) => (res.ok ? res.json() : null))
-      .then((data) => {
-        if (data) setStudent(data);
-      })
-      .catch(() => {});
-
-    fetch('/api/professor/profile')
-      .then((res) => (res.ok ? res.json() : null))
-      .then((data) => {
-        if (data) setProfessor(data);
-      })
-      .catch(() => {});
-
-    fetch('/api/questions')
-      .then((res) => (res.ok ? res.json() : null))
-      .then((data) => {
-        if (Array.isArray(data) && data.length > 0) {
-          setQuestions(data);
+    let mounted = true;
+    checkCurrentSession()
+      .then((profile) => {
+        if (!mounted) return;
+        if (profile) {
+          applyAuthenticatedProfile(profile, false);
+        } else {
+          setIsLoggedIn(false);
+          setCurrentScreen('login');
         }
       })
-      .catch(() => {});
+      .finally(() => { if (mounted) setIsCheckingSession(false); });
+    return () => { mounted = false; };
   }, []);
+
+  // Load role-scoped application data after authentication.
+  useEffect(() => {
+    if (!isLoggedIn) return;
+    const profileEndpoint = userRole === 'student' ? '/api/student' : '/api/professor/profile';
+    fetch(profileEndpoint, { credentials: 'include' })
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => {
+        if (!data) return;
+        if (userRole === 'student') setStudent(data);
+        else setProfessor(data);
+      })
+      .catch(() => {});
+
+    fetch('/api/questions', { credentials: 'include' })
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => { if (Array.isArray(data) && data.length > 0) setQuestions(data); })
+      .catch(() => {});
+  }, [isLoggedIn, userRole]);
 
   const handleNavigate = (screen: ScreenType, params?: { questionId?: string; missionId?: string }) => {
     if (params?.questionId) {
@@ -129,33 +144,33 @@ export default function App() {
     window.scrollTo({ top: 0, behavior: 'smooth' });
   };
 
-  const handleSwitchRole = (newRole: UserRole) => {
-    setUserRole(newRole);
-    if (newRole === 'professor') {
-      setCurrentScreen('professor-dashboard');
-      showToast('Modo Docente Ativado: Prof. Dr. Carlos Medeiros', 'success');
-    } else {
-      setCurrentScreen('dashboard');
-      showToast('Modo Estudante Ativado: Gabriel Siqueira', 'success');
-    }
-  };
-
-  const handleLogin = (role: UserRole = 'student', studentData?: Partial<Student>) => {
-    if (studentData) {
-      setStudent((prev) => ({ ...prev, ...studentData }));
-    }
-    setUserRole(role);
+  const applyAuthenticatedProfile = (profile: InternalUserProfile, showWelcome = true) => {
+    setCurrentUser(profile);
+    const mappedRole: UserRole =
+      profile.role === 'PROFESSOR' ? 'professor' :
+      profile.role === 'COORDINATOR' ? 'coordinator' :
+      profile.role === 'ADMIN' ? 'admin' : 'student';
+    setUserRole(mappedRole);
     setIsLoggedIn(true);
-    if (role === 'professor') {
-      setCurrentScreen('professor-dashboard');
-      showToast('Bem-vindo ao Painel Docente Mack ENADE!', 'success');
-    } else {
+
+    if (mappedRole === 'student') {
+      setStudent((prev) => ({ ...prev, name: profile.name, email: profile.institutionalEmail, course: profile.course }));
       setCurrentScreen('dashboard');
-      showToast('Bem-vindo de volta ao Mack ENADE!', 'success');
+      if (showWelcome) showToast('Bem-vindo de volta ao Mack ENADE!', 'success');
+    } else if (mappedRole === 'professor') {
+      setProfessor((prev) => ({ ...prev, name: profile.name, email: profile.institutionalEmail, course: profile.course }));
+      setCurrentScreen('professor-dashboard');
+      if (showWelcome) showToast('Bem-vindo ao Painel Docente Mack ENADE!', 'success');
+    } else {
+      setProfessor((prev) => ({ ...prev, name: profile.name, email: profile.institutionalEmail, course: profile.course }));
+      setCurrentScreen('management-dashboard');
+      if (showWelcome) showToast('Bem-vindo ao Painel de Gestão Mack ENADE!', 'success');
     }
   };
 
-  const handleLogout = () => {
+  const handleLogout = async () => {
+    await logoutSession();
+    setCurrentUser(null);
     setIsLoggedIn(false);
     setCurrentScreen('login');
   };
@@ -339,12 +354,20 @@ export default function App() {
     showToast(`+${earnedXp} XP adicionados pelo Simulado Oficial!`, 'xp');
   };
 
-  // Render Login screen if user is not logged in or explicitly at login screen
+  if (isCheckingSession) {
+    return (
+      <div className="min-h-screen bg-[#F8F9FA] flex items-center justify-center text-sm font-semibold text-zinc-600">
+        Verificando acesso ao Mack ENADE...
+      </div>
+    );
+  }
+
+  // Render Login screen if user is not authenticated.
   if (!isLoggedIn || currentScreen === 'login') {
     return (
       <>
         <PWAController />
-        <LoginScreen onLogin={handleLogin} />
+        <LoginScreen onLoginSuccess={(profile) => applyAuthenticatedProfile(profile, true)} />
       </>
     );
   }
@@ -363,7 +386,7 @@ export default function App() {
         userRole={userRole}
         student={student}
         professor={professor}
-        onSwitchRole={handleSwitchRole}
+        currentUser={currentUser}
         onLogout={handleLogout}
       />
 
@@ -470,6 +493,13 @@ export default function App() {
           />
         )}
 
+        {currentScreen === 'management-dashboard' && currentUser && (
+          <ManagementDashboardScreen
+            currentUser={currentUser}
+            onNavigate={handleNavigate}
+          />
+        )}
+
         {/* PROFESSOR SCREENS */}
         {currentScreen === 'professor-dashboard' && (
           <ProfessorDashboardScreen
@@ -561,12 +591,6 @@ export default function App() {
                 </button>
               </>
             )}
-            <button
-              onClick={() => handleSwitchRole(userRole === 'student' ? 'professor' : 'student')}
-              className="text-[#EA0029] font-bold hover:underline cursor-pointer"
-            >
-              Alternar para {userRole === 'student' ? 'Docente' : 'Estudante'}
-            </button>
           </div>
         </div>
       </footer>

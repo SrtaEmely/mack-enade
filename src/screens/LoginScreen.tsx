@@ -13,24 +13,21 @@ import {
   Eye,
   EyeOff,
   HelpCircle,
-  UserCheck,
   Compass,
 } from 'lucide-react';
 import { UPMLogo } from '../components/UPMLogo';
 import { PWAInstallButton } from '../components/PWAController';
-import { InternalUserProfile, MackEnadeRole } from '../types';
+import { InternalUserProfile } from '../types';
 import { loginWithEmailAndCode, APP_ENV } from '../services/pilotAuth';
 
 interface LoginScreenProps {
   onLoginSuccess?: (profile: InternalUserProfile) => void;
-  onLogin?: (role?: any, studentData?: any) => void;
 }
 
-export const LoginScreen: React.FC<LoginScreenProps> = ({ onLoginSuccess, onLogin }) => {
+export const LoginScreen: React.FC<LoginScreenProps> = ({ onLoginSuccess }) => {
   const [email, setEmail] = useState('');
   const [accessCode, setAccessCode] = useState('');
   const [showAccessCode, setShowAccessCode] = useState(false);
-  const [selectedRole, setSelectedRole] = useState<MackEnadeRole | undefined>(undefined);
   const [isAuthenticating, setIsAuthenticating] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [secondaryMessage, setSecondaryMessage] = useState<string | null>(null);
@@ -55,7 +52,7 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({ onLoginSuccess, onLogi
     setSuccessNotice(null);
 
     try {
-      const profile = await loginWithEmailAndCode(cleanEmail, cleanCode, selectedRole);
+      const profile = await loginWithEmailAndCode(cleanEmail, cleanCode);
       setIsAuthenticating(false);
 
       // Show First Login Experience modal
@@ -74,29 +71,10 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({ onLoginSuccess, onLogi
     const profile = welcomeUser;
     setWelcomeUser(null);
 
-    if (typeof onLoginSuccess === 'function') {
-      onLoginSuccess(profile);
-    }
-    if (typeof onLogin === 'function') {
-      const appRole =
-        profile.role === 'PROFESSOR' || profile.role === 'COORDINATOR' || profile.role === 'ADMIN'
-          ? 'professor'
-          : 'student';
-      onLogin(appRole, {
-        name: profile.name,
-        email: profile.institutionalEmail,
-        course: profile.course,
-      });
-    }
+    onLoginSuccess?.(profile);
   };
 
-  const handleQuickFill = (testEmail: string, testCode: string, role?: MackEnadeRole) => {
-    setEmail(testEmail);
-    setAccessCode(testCode);
-    setSelectedRole(role);
-    setErrorMessage(null);
-    setSecondaryMessage(null);
-  };
+
 
   return (
     <div className="min-h-screen bg-[#F4F5F7] flex flex-col justify-between selection:bg-[#EA0029] selection:text-white">
@@ -276,80 +254,6 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({ onLoginSuccess, onLogi
                 </div>
               </form>
 
-              {/* Pilot Accounts Quick Fill (Testing Convenience) */}
-              <div className="mt-6 pt-5 border-t border-zinc-100">
-                <div className="flex items-center justify-between mb-2">
-                  <span className="text-[11px] font-bold uppercase tracking-wider text-zinc-400 flex items-center gap-1.5">
-                    <UserCheck className="w-3.5 h-3.5 text-zinc-400" />
-                    Contas de Teste do Piloto
-                  </span>
-                  <span className="text-[10px] text-zinc-500 bg-zinc-100 px-1.5 py-0.5 rounded font-mono">
-                    Google Sheets
-                  </span>
-                </div>
-
-                <div className="space-y-1.5">
-                  <button
-                    type="button"
-                    onClick={() => handleQuickFill('1007000050@mackenzie.br', '1234', 'STUDENT')}
-                    className="w-full text-left p-2.5 rounded-lg border border-zinc-200/70 hover:border-[#EA0029]/40 hover:bg-red-50/30 transition-colors flex items-center justify-between text-xs group cursor-pointer"
-                  >
-                    <div>
-                      <div className="font-semibold text-zinc-800 flex items-center gap-1.5">
-                        <GraduationCap className="w-3.5 h-3.5 text-[#EA0029]" />
-                        <span>Emely (Estudante Produção)</span>
-                        <span className="bg-red-100 text-[#EA0029] text-[9px] font-bold px-1 rounded">PROD</span>
-                      </div>
-                      <div className="text-[11px] text-zinc-400 font-mono mt-0.5">
-                        1007000050@mackenzie.br • <span className="text-zinc-600 font-semibold">Código: 1234</span>
-                      </div>
-                    </div>
-                    <span className="text-[11px] font-semibold text-[#EA0029] opacity-0 group-hover:opacity-100 transition-opacity">
-                      Preencher
-                    </span>
-                  </button>
-
-                  <button
-                    type="button"
-                    onClick={() => handleQuickFill('1007000050@mackenzie.br', '1234', 'PROFESSOR')}
-                    className="w-full text-left p-2.5 rounded-lg border border-zinc-200/70 hover:border-[#EA0029]/40 hover:bg-red-50/30 transition-colors flex items-center justify-between text-xs group cursor-pointer"
-                  >
-                    <div>
-                      <div className="font-semibold text-zinc-800 flex items-center gap-1.5">
-                        <BookOpen className="w-3.5 h-3.5 text-[#EA0029]" />
-                        <span>Emely (Docente / Mentora)</span>
-                        <span className="bg-zinc-100 text-zinc-700 text-[9px] font-bold px-1 rounded">Mentor</span>
-                      </div>
-                      <div className="text-[11px] text-zinc-400 font-mono mt-0.5">
-                        1007000050@mackenzie.br • <span className="text-zinc-600 font-semibold">Código: 1234</span>
-                      </div>
-                    </div>
-                    <span className="text-[11px] font-semibold text-[#EA0029] opacity-0 group-hover:opacity-100 transition-opacity">
-                      Preencher
-                    </span>
-                  </button>
-
-                  <button
-                    type="button"
-                    onClick={() => handleQuickFill('gabriel.siqueira@mackenzista.com.br', 'MACK-7K4P9X', 'STUDENT')}
-                    className="w-full text-left p-2.5 rounded-lg border border-zinc-200/70 hover:border-[#EA0029]/40 hover:bg-red-50/30 transition-colors flex items-center justify-between text-xs group cursor-pointer"
-                  >
-                    <div>
-                      <div className="font-semibold text-zinc-800 flex items-center gap-1.5">
-                        <GraduationCap className="w-3.5 h-3.5 text-zinc-500" />
-                        <span>Gabriel Siqueira (Estudante)</span>
-                        <span className="bg-zinc-100 text-zinc-600 text-[9px] font-bold px-1 rounded">PROD</span>
-                      </div>
-                      <div className="text-[11px] text-zinc-400 font-mono mt-0.5">
-                        gabriel.siqueira@... • <span className="text-zinc-600 font-semibold">Código: MACK-7K4P9X</span>
-                      </div>
-                    </div>
-                    <span className="text-[11px] font-semibold text-[#EA0029] opacity-0 group-hover:opacity-100 transition-opacity">
-                      Preencher
-                    </span>
-                  </button>
-                </div>
-              </div>
             </div>
 
             {/* Feature highlights badge */}

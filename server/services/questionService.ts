@@ -154,9 +154,9 @@ const INITIAL_APPROVED_QUESTIONS: SheetQuestion[] = [
 
 export class QuestionService {
   constructor() {
-    // Seed approved initial questions
-    for (const q of INITIAL_APPROVED_QUESTIONS) {
-      googleSheetsService.addSeedQuestion(q);
+    // Development-only demo questions. PILOT/PRODUCTION use Google Sheets as source of truth.
+    if ((process.env.APP_ENV || 'PILOT').toUpperCase() === 'DEVELOPMENT') {
+      for (const q of INITIAL_APPROVED_QUESTIONS) googleSheetsService.addSeedQuestion(q);
     }
   }
 
@@ -267,7 +267,7 @@ export class QuestionService {
       expected_response_time: data.expected_response_time || 120,
     };
 
-    return googleSheetsService.saveQuestion(question);
+    return await googleSheetsService.saveQuestion(question);
   }
 
   /**
@@ -314,14 +314,14 @@ export class QuestionService {
       expected_response_time: data.expected_response_time || 120,
     };
 
-    return googleSheetsService.saveQuestion(question);
+    return await googleSheetsService.saveQuestion(question);
   }
 
   /**
    * Submits a question for institutional review: status becomes PENDING_REVIEW
    */
   public async submitForReview(questionId: string): Promise<SheetQuestion> {
-    const updated = googleSheetsService.updateQuestionStatus(questionId, 'PENDING_REVIEW', false);
+    const updated = await googleSheetsService.updateQuestionStatus(questionId, 'PENDING_REVIEW', false);
     if (!updated) {
       throw new Error(`Questão ${questionId} não encontrada para envio de revisão.`);
     }
@@ -342,7 +342,7 @@ export class QuestionService {
     existing.reviewed_by = reviewerName;
     existing.updated_at = new Date().toISOString();
 
-    return googleSheetsService.saveQuestion(existing);
+    return await googleSheetsService.saveQuestion(existing);
   }
 
   /**
@@ -361,7 +361,7 @@ export class QuestionService {
       updated_at: new Date().toISOString(),
     };
 
-    return googleSheetsService.saveQuestion(updated);
+    return await googleSheetsService.saveQuestion(updated);
   }
 }
 
